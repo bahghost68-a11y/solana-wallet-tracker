@@ -37,11 +37,38 @@ const ASSOCIATED_TOKEN_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 // Metaplex Token Metadata Program
 const METADATA_PROGRAM = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s";
 
-// Token creation instruction discriminators
-const CREATE_MINT_INSTRUCTIONS = [
+// Known launchpad / DEX programs
+const KNOWN_LAUNCHPADS = {
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P": "pump.fun",
+  "pumpkinfCnfqEjbTPAdw3XAhpbxU2sEgxRTmEJBGFP3": "pump.fun (v2)",
+  "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo": "Meteora DLMM",
+  "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB": "Meteora Pools",
+  "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8": "Raydium AMM",
+  "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK": "Raydium CLMM",
+  "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C": "Raydium CPMM",
+  "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc": "Orca Whirlpool",
+  "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4": "Jupiter v6",
+};
+
+// Token-related instruction types to detect
+const TOKEN_CREATION_TYPES = [
   "initializeMint",
   "initializeMint2",
-  "createAccount",
+  "initializeAccount",
+  "initializeAccount2",
+  "initializeAccount3",
+  "mintTo",
+  "mintToChecked",
+];
+
+// Log patterns that indicate token activity
+const TOKEN_LOG_PATTERNS = [
+  "InitializeMint",
+  "initializeMint",
+  "InitializeMint2",
+  "InitializeAccount",
+  "MintTo",
+  "Program log: Instruction: Create",
 ];
 
 // ─── State ──────────────────────────────────────────────────────────────────
@@ -232,40 +259,41 @@ function analyzeTransactionForTokenCreation(tx, trackedWallet) {
     typeof k === "string" ? k : k.pubkey
   );
 
-  // Check if the tracked wallet is the fee payer (index 0 = fee payer)
   const walletIndex = accountKeys.indexOf(trackedWallet);
   if (walletIndex === -1) return null;
 
   const results = [];
+  const foundMints = new Set();
 
-  // Check inner instructions and main instructions for token creation
   const allInstructions = [
     ...(message.instructions || []),
     ...(tx.meta.innerInstructions || []).flatMap((ix) => ix.instructions || []),
   ];
 
+  // Method 1: Check parsed instructions from Token Program / Token-2022
   for (const ix of allInstructions) {
     const programId = ix.programId || accountKeys[ix.programIdIndex];
 
-    // Check for initializeMint instructions from Token Program
     if (programId === TOKEN_PROGRAM || programId === TOKEN_2022_PROGRAM) {
       const parsed = ix.parsed;
-      if (parsed && CREATE_MINT_INSTRUCTIONS.includes(parsed.type)) {
+      if (parsed && TOKEN_CREATION_TYPES.includes(parsed.type)) {
         const mintAddress =
           parsed.info?.mint || parsed.info?.account || null;
-        if (mintAddress) {
+        if (mintAddress && !foundMints.has(mintAddress)) {
+          foundMints.add(mintAddress);
           results.push({
             type: "token_creation",
             mintAddress,
             program: programId === TOKEN_PROGRAM ? "SPL Token" : "Token-2022",
             creator: trackedWallet,
             signature: tx.transaction.signatures[0],
+            method: `instruction:${parsed.type}`,
           });
         }
       }
     }
 
-    // Check for Metaplex create metadata calls (common in token launches)
+    // Check for Metaplex create metadata calls
     if (programId === METADATA_PROGRAM) {
       const parsed = ix.parsed;
       if (parsed && parsed.type === "create") {
@@ -275,41 +303,95 @@ function analyzeTransactionForTokenCreation(tx, trackedWallet) {
         });
       }
     }
+
+    // Check for known launchpad programs
+    if (KNOWN_LAUNCHPADS[programId]) {
+      const launchpadName = KNOWN_LAUNCHPADS[programId];
+      log(`Interaction avec ${launchpadName} détectée (${programId.slice(0, 8)}...)`);
+    }
   }
 
-  // Also check log messages for mint initialization
+  // Method 2: Detect new mints from postTokenBalances vs preTokenBalances
+  const preMints = new Set(
+    (tx.meta.preTokenBalances || []).map((b) => b.mint)
+  );
+  const postMints = new Set(
+    (tx.meta.postTokenBalances || []).map((b) => b.mint)
+  );
+
+  for (const tb of tx.meta.postTokenBalances || []) {
+    if (!preMints.has(tb.mint) && !foundMints.has(tb.mint)) {
+      foundMints.add(tb.mint);
+      results.push({
+        type: "token_creation",
+        mintAddress: tb.mint,
+        program: tb.programId || "unknown",
+        creator: trackedWallet,
+        signature: tx.transaction.signatures[0],
+        method: "new_mint_in_postTokenBalances",
+      });
+    }
+  }
+
+  // Method 3: Check log messages for token-related patterns
   if (tx.meta.logMessages) {
-    for (const logMsg of tx.meta.logMessages) {
-      if (
-        logMsg.includes("InitializeMint") ||
-        logMsg.includes("initializeMint")
-      ) {
-        // Try to extract mint address from inner instructions
-        for (const ix of allInstructions) {
-          const programId = ix.programId || accountKeys[ix.programIdIndex];
-          if (programId === SYSTEM_PROGRAM && ix.parsed?.type === "createAccount") {
-            const newAccount = ix.parsed.info?.newAccount;
-            const owner = ix.parsed.info?.owner;
-            if (
-              newAccount &&
-              (owner === TOKEN_PROGRAM || owner === TOKEN_2022_PROGRAM)
-            ) {
-              const alreadyFound = results.some(
-                (r) => r.mintAddress === newAccount
-              );
-              if (!alreadyFound) {
-                results.push({
-                  type: "token_creation",
-                  mintAddress: newAccount,
-                  program:
-                    owner === TOKEN_PROGRAM ? "SPL Token" : "Token-2022",
-                  creator: trackedWallet,
-                  signature: tx.transaction.signatures[0],
-                });
-              }
-            }
+    const hasTokenLog = tx.meta.logMessages.some((l) =>
+      TOKEN_LOG_PATTERNS.some((p) => l.includes(p))
+    );
+
+    if (hasTokenLog) {
+      // Extract mint addresses from createAccount instructions (owner = Token Program)
+      for (const ix of allInstructions) {
+        const programId = ix.programId || accountKeys[ix.programIdIndex];
+        if (programId === SYSTEM_PROGRAM && ix.parsed?.type === "createAccount") {
+          const newAccount = ix.parsed.info?.newAccount;
+          const owner = ix.parsed.info?.owner;
+          if (
+            newAccount &&
+            (owner === TOKEN_PROGRAM || owner === TOKEN_2022_PROGRAM) &&
+            !foundMints.has(newAccount)
+          ) {
+            foundMints.add(newAccount);
+            results.push({
+              type: "token_creation",
+              mintAddress: newAccount,
+              program: owner === TOKEN_PROGRAM ? "SPL Token" : "Token-2022",
+              creator: trackedWallet,
+              signature: tx.transaction.signatures[0],
+              method: "log_pattern+createAccount",
+            });
           }
         }
+      }
+    }
+
+    // Method 4: Detect launchpad interactions from logs
+    for (const logMsg of tx.meta.logMessages) {
+      for (const [progId, name] of Object.entries(KNOWN_LAUNCHPADS)) {
+        if (logMsg.includes(progId)) {
+          log(`Log de ${name} détecté`);
+        }
+      }
+    }
+  }
+
+  // Method 5: Check all token balances where this wallet is the owner
+  for (const tb of tx.meta.postTokenBalances || []) {
+    if (tb.owner === trackedWallet && !foundMints.has(tb.mint)) {
+      const preEntry = (tx.meta.preTokenBalances || []).find(
+        (p) => p.mint === tb.mint && p.owner === trackedWallet
+      );
+      // New token balance for this wallet that didn't exist before
+      if (!preEntry) {
+        foundMints.add(tb.mint);
+        results.push({
+          type: "token_creation",
+          mintAddress: tb.mint,
+          program: tb.programId || "unknown",
+          creator: trackedWallet,
+          signature: tx.transaction.signatures[0],
+          method: "new_token_balance_for_wallet",
+        });
       }
     }
   }
@@ -483,8 +565,15 @@ async function handleAccountNotification(params) {
 
       if (ratio >= CONFIG.TRANSFER_THRESHOLD) {
         log("Transfert massif détecté! Analyse des transactions...");
+        previousBalance = newBalance;
         await analyzeRecentTransactions();
+        return;
       }
+    }
+
+    // Also scan recent transactions for token activity on any balance change
+    if (newBalance !== oldBalance) {
+      await scanForTokenActivity();
     }
 
     previousBalance = newBalance;
@@ -502,36 +591,24 @@ async function handleLogsNotification(params) {
   const { signature, logs } = result.value;
   if (!signature || !logs) return;
 
-  // Quick check: does this log mention token initialization?
-  const hasTokenCreation = logs.some(
+  // Check for ANY token-related activity in logs
+  const hasTokenActivity = logs.some(
     (l) =>
-      l.includes("InitializeMint") ||
-      l.includes("initializeMint") ||
-      l.includes("InitializeMint2")
+      TOKEN_LOG_PATTERNS.some((p) => l.includes(p)) ||
+      l.includes(TOKEN_PROGRAM) ||
+      l.includes(TOKEN_2022_PROGRAM) ||
+      Object.keys(KNOWN_LAUNCHPADS).some((p) => l.includes(p))
   );
 
-  if (hasTokenCreation) {
-    log(`Possible création de token détectée (sig: ${signature.slice(0, 16)}...)`);
+  if (hasTokenActivity) {
+    log(`Activité token détectée (sig: ${signature.slice(0, 16)}...)`);
     // Fetch full transaction for details
     try {
       // Small delay to let the transaction finalize
       await sleep(2000);
       const tx = await getTransaction(signature);
       if (tx) {
-        const tokens = analyzeTransactionForTokenCreation(tx, currentWallet);
-        if (tokens && tokens.length > 0) {
-          for (const token of tokens) {
-            if (token.type === "token_creation") {
-              logAlert(
-                `TOKEN CREE!\n` +
-                `  Adresse contrat (Mint): ${token.mintAddress}\n` +
-                `  Programme: ${token.program}\n` +
-                `  Créateur: ${token.creator}\n` +
-                `  Signature TX: ${token.signature}`
-              );
-            }
-          }
-        }
+        reportTokenFindings(tx, currentWallet);
       }
     } catch (e) {
       logWarn(`Erreur analyse token: ${e.message}`);
@@ -539,9 +616,53 @@ async function handleLogsNotification(params) {
   }
 }
 
+function reportTokenFindings(tx, wallet) {
+  const tokens = analyzeTransactionForTokenCreation(tx, wallet);
+  if (tokens && tokens.length > 0) {
+    for (const token of tokens) {
+      if (token.type === "token_creation") {
+        logAlert(
+          `TOKEN DETECTE!\n` +
+          `  Adresse contrat (Mint): ${token.mintAddress}\n` +
+          `  Programme: ${token.program}\n` +
+          `  Créateur: ${token.creator}\n` +
+          `  Méthode de détection: ${token.method}\n` +
+          `  Signature TX: ${token.signature}`
+        );
+      }
+    }
+  }
+  return tokens;
+}
+
+// Track already-reported signatures to avoid duplicates
+const reportedSignatures = new Set();
+
+async function scanForTokenActivity() {
+  try {
+    const sigs = await getSignaturesForAddress(currentWallet, 3);
+    if (!sigs || sigs.length === 0) return;
+
+    for (const sigInfo of sigs) {
+      if (sigInfo.err) continue;
+      if (reportedSignatures.has(sigInfo.signature)) continue;
+
+      const tx = await getTransaction(sigInfo.signature);
+      if (!tx) continue;
+
+      const tokens = reportTokenFindings(tx, currentWallet);
+      if (tokens && tokens.length > 0) {
+        reportedSignatures.add(sigInfo.signature);
+      }
+    }
+  } catch (e) {
+    logWarn(`Erreur scan token: ${e.message}`);
+  }
+}
+
 async function analyzeRecentTransactions() {
   try {
-    const sigs = await getSignaturesForAddress(currentWallet, 5);
+    const sigs = await getSignaturesForAddress(currentWallet, 10);
     if (!sigs || sigs.length === 0) {
       log("Aucune transaction récente trouvée.");
       return;
@@ -554,18 +675,10 @@ async function analyzeRecentTransactions() {
       if (!tx) continue;
 
       // Check for token creation
-      const tokens = analyzeTransactionForTokenCreation(tx, currentWallet);
-      if (tokens) {
-        for (const token of tokens) {
-          if (token.type === "token_creation") {
-            logAlert(
-              `TOKEN CREE!\n` +
-              `  Adresse contrat (Mint): ${token.mintAddress}\n` +
-              `  Programme: ${token.program}\n` +
-              `  Créateur: ${token.creator}\n` +
-              `  Signature TX: ${token.signature}`
-            );
-          }
+      if (!reportedSignatures.has(sigInfo.signature)) {
+        const tokens = reportTokenFindings(tx, currentWallet);
+        if (tokens && tokens.length > 0) {
+          reportedSignatures.add(sigInfo.signature);
         }
       }
 
@@ -580,11 +693,14 @@ async function analyzeRecentTransactions() {
           `  Signature TX: ${transfer.signature}`
         );
 
+        // Clear reported sigs for new wallet
+        reportedSignatures.clear();
+
         await switchToWallet(
           transfer.to,
           `Transfert de ${transfer.amountSOL.toFixed(4)} SOL (${(transfer.ratio * 100).toFixed(1)}%)`
         );
-        return; // Stop after switching
+        return;
       }
     }
 
