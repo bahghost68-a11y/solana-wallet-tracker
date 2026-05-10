@@ -3,6 +3,8 @@
 const WebSocket = require("ws");
 const https = require("https");
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 const CONFIG = {
@@ -11,14 +13,14 @@ const CONFIG = {
   RPC_WS: process.env.FLUXRPC_WS || "wss://ws.eu.fluxrpc.com",
   API_KEY: process.env.FLUXRPC_API_KEY || "",
 
-  // Wallet to track (pass as CLI arg or env var)
-  INITIAL_WALLET: process.argv[2] || process.env.TRACK_WALLET || "",
+  // Telegram
+  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || "",
+  TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || "",
 
   // Threshold: percentage of balance that must be sent to consider it "all SOL"
-  // 0.95 = 95% (accounts for tx fees)
   TRANSFER_THRESHOLD: parseFloat(process.env.TRANSFER_THRESHOLD || "0.95"),
 
-  // Polling interval in ms for balance checks (fallback if WS disconnects)
+  // Polling interval in ms for balance checks
   POLL_INTERVAL: parseInt(process.env.POLL_INTERVAL || "5000", 10),
 
   // Reconnect delay in ms
@@ -26,6 +28,12 @@ const CONFIG = {
 
   // Commitment level
   COMMITMENT: process.env.COMMITMENT || "confirmed",
+
+  // Telegram polling interval
+  TELEGRAM_POLL_INTERVAL: parseInt(process.env.TELEGRAM_POLL_INTERVAL || "2000", 10),
+
+  // Data file for persisting tracked wallets
+  DATA_FILE: process.env.DATA_FILE || path.join(__dirname, "wallets.json"),
 };
 
 // Known program IDs
@@ -33,8 +41,6 @@ const SYSTEM_PROGRAM = "11111111111111111111111111111111";
 const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const ASSOCIATED_TOKEN_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-
-// Metaplex Token Metadata Program
 const METADATA_PROGRAM = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s";
 
 // Known launchpad / DEX programs
@@ -50,24 +56,17 @@ const KNOWN_LAUNCHPADS = {
   "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4": "Jupiter v6",
 };
 
-// Wrapped SOL mint address — always ignore this
 const WRAPPED_SOL = "So11111111111111111111111111111111111111112";
-
-// ONLY these instructions indicate a REAL new token creation
 const MINT_CREATION_TYPES = ["initializeMint", "initializeMint2"];
-
-// Log patterns that indicate REAL token creation (not just account init)
 const MINT_LOG_PATTERNS = ["InitializeMint", "InitializeMint2"];
 
 // ─── State ──────────────────────────────────────────────────────────────────
-let currentWallet = "";
-let previousBalance = 0;
+// Each tracked wallet: { address, balance, accountSubId, logsSubId, history[], label }
+let trackedWallets = new Map();
 let ws = null;
-let accountSubId = null;
-let logsSubId = null;
 let rpcId = 1;
-let walletHistory = [];
 let isShuttingDown = false;
+const reportedSignatures = new Set();
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 function log(msg) {
@@ -92,7 +91,373 @@ function logAlert(msg) {
   console.log(`${"=".repeat(60)}\n`);
 }
 
+// ─── Telegram Bot ───────────────────────────────────────────────────────────
+let telegramOffset = 0;
+
+function telegramRequest(method, params = {}) {
+  return new Promise((resolve, reject) => {
+    if (!CONFIG.TELEGRAM_BOT_TOKEN) {
+      resolve(null);
+      return;
+    }
+
+    const body = JSON.stringify(params);
+    const options = {
+      hostname: "api.telegram.org",
+      port: 443,
+      path: `/bot${CONFIG.TELEGRAM_BOT_TOKEN}/${method}`,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(data);
+          resolve(json);
+        } catch (e) {
+          reject(new Error(`Telegram parse error: ${e.message}`));
+        }
+      });
+    });
+
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+async function sendTelegram(text, chatId = null) {
+  const targetChat = chatId || CONFIG.TELEGRAM_CHAT_ID;
+  if (!CONFIG.TELEGRAM_BOT_TOKEN || !targetChat) return;
+
+  try {
+    await telegramRequest("sendMessage", {
+      chat_id: targetChat,
+      text,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    });
+  } catch (e) {
+    logWarn(`Erreur Telegram: ${e.message}`);
+  }
+}
+
+async function pollTelegram() {
+  if (!CONFIG.TELEGRAM_BOT_TOKEN || isShuttingDown) return;
+
+  try {
+    const result = await telegramRequest("getUpdates", {
+      offset: telegramOffset,
+      timeout: 1,
+      allowed_updates: ["message"],
+    });
+
+    if (!result || !result.ok || !result.result) return;
+
+    for (const update of result.result) {
+      telegramOffset = update.update_id + 1;
+      if (update.message && update.message.text) {
+        const chatId = update.message.chat.id.toString();
+        const text = update.message.text.trim();
+
+        // Auto-set chat ID if not configured
+        if (!CONFIG.TELEGRAM_CHAT_ID) {
+          CONFIG.TELEGRAM_CHAT_ID = chatId;
+          log(`Chat ID Telegram configuré: ${chatId}`);
+        }
+
+        await handleTelegramCommand(text, chatId);
+      }
+    }
+  } catch (e) {
+    // Silently ignore polling errors
+  }
+}
+
+async function handleTelegramCommand(text, chatId) {
+  const parts = text.split(/\s+/);
+  const command = parts[0].toLowerCase().replace(/@\w+$/, "");
+
+  switch (command) {
+    case "/start":
+      await sendTelegram(
+        "🤖 <b>Solana Wallet Tracker Bot</b>\n\n" +
+        "Commandes disponibles:\n" +
+        "/add <code>&lt;adresse&gt;</code> [label] — Ajouter un wallet à suivre\n" +
+        "/remove <code>&lt;adresse&gt;</code> — Supprimer un wallet\n" +
+        "/list — Voir tous les wallets suivis\n" +
+        "/status — État du bot et connexions\n" +
+        "/help — Afficher cette aide",
+        chatId
+      );
+      break;
+
+    case "/help":
+      await sendTelegram(
+        "📖 <b>Aide</b>\n\n" +
+        "<b>Commandes:</b>\n" +
+        "/add <code>&lt;adresse&gt;</code> [label] — Ajouter un wallet\n" +
+        "/remove <code>&lt;adresse&gt;</code> — Supprimer un wallet\n" +
+        "/list — Liste des wallets suivis\n" +
+        "/status — État du bot\n\n" +
+        "<b>Fonctionnement:</b>\n" +
+        "• Le bot surveille les wallets en temps réel\n" +
+        "• Si un wallet envoie tout son SOL → suit le nouveau wallet\n" +
+        "• Si un wallet crée un token → envoie l'adresse contrat\n" +
+        "• La chaîne de suivi est automatique et infinie",
+        chatId
+      );
+      break;
+
+    case "/add": {
+      const address = parts[1];
+      const label = parts.slice(2).join(" ") || "";
+
+      if (!address) {
+        await sendTelegram("❌ Usage: /add <code>&lt;adresse_wallet&gt;</code> [label]", chatId);
+        return;
+      }
+
+      if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) {
+        await sendTelegram("❌ Adresse invalide (format base58 attendu)", chatId);
+        return;
+      }
+
+      if (trackedWallets.has(address)) {
+        await sendTelegram(`⚠️ Wallet déjà suivi: <code>${address}</code>`, chatId);
+        return;
+      }
+
+      try {
+        const balance = await getBalance(address);
+        await addWallet(address, label, balance);
+        await sendTelegram(
+          `✅ <b>Wallet ajouté</b>\n` +
+          `📍 <code>${address}</code>\n` +
+          (label ? `🏷 Label: ${label}\n` : "") +
+          `💰 Balance: ${(balance / 1e9).toFixed(4)} SOL`,
+          chatId
+        );
+      } catch (e) {
+        await sendTelegram(`❌ Erreur: ${e.message}`, chatId);
+      }
+      break;
+    }
+
+    case "/remove": {
+      const address = parts[1];
+      if (!address) {
+        await sendTelegram("❌ Usage: /remove <code>&lt;adresse_wallet&gt;</code>", chatId);
+        return;
+      }
+
+      if (!trackedWallets.has(address)) {
+        // Try partial match
+        const match = [...trackedWallets.keys()].find(
+          (w) => w.startsWith(address) || w.endsWith(address)
+        );
+        if (match) {
+          removeWallet(match);
+          await sendTelegram(`✅ Wallet supprimé: <code>${match}</code>`, chatId);
+        } else {
+          await sendTelegram("❌ Wallet non trouvé", chatId);
+        }
+        return;
+      }
+
+      removeWallet(address);
+      await sendTelegram(`✅ Wallet supprimé: <code>${address}</code>`, chatId);
+      break;
+    }
+
+    case "/list": {
+      if (trackedWallets.size === 0) {
+        await sendTelegram("📋 Aucun wallet suivi.\nUtilisez /add pour en ajouter.", chatId);
+        return;
+      }
+
+      let msg = `📋 <b>Wallets suivis (${trackedWallets.size}):</b>\n\n`;
+      let i = 1;
+      for (const [addr, info] of trackedWallets) {
+        const bal = (info.balance / 1e9).toFixed(4);
+        const lbl = info.label ? ` (${info.label})` : "";
+        const hist = info.history.length > 0
+          ? `\n   ↳ ${info.history.length} switch(es)`
+          : "";
+        msg += `${i}. <code>${addr.slice(0, 8)}...${addr.slice(-4)}</code>${lbl}\n   💰 ${bal} SOL${hist}\n\n`;
+        i++;
+      }
+      await sendTelegram(msg, chatId);
+      break;
+    }
+
+    case "/status": {
+      const wsStatus = ws && ws.readyState === WebSocket.OPEN ? "✅ Connecté" : "❌ Déconnecté";
+      const uptime = process.uptime();
+      const hours = Math.floor(uptime / 3600);
+      const mins = Math.floor((uptime % 3600) / 60);
+
+      await sendTelegram(
+        `📊 <b>Status du Bot</b>\n\n` +
+        `🔌 WebSocket: ${wsStatus}\n` +
+        `👛 Wallets suivis: ${trackedWallets.size}\n` +
+        `⏱ Uptime: ${hours}h ${mins}m\n` +
+        `🔄 Seuil transfert: ${(CONFIG.TRANSFER_THRESHOLD * 100).toFixed(0)}%\n` +
+        `📡 RPC: ${CONFIG.RPC_HTTP}`,
+        chatId
+      );
+      break;
+    }
+
+    default:
+      if (text.startsWith("/")) {
+        await sendTelegram("❓ Commande inconnue. Tapez /help pour l'aide.", chatId);
+      }
+  }
+}
+
+// ─── Wallet Persistence ─────────────────────────────────────────────────────
+
+function saveWallets() {
+  const data = {};
+  for (const [addr, info] of trackedWallets) {
+    data[addr] = {
+      label: info.label,
+      history: info.history,
+      addedAt: info.addedAt,
+    };
+  }
+  try {
+    fs.writeFileSync(CONFIG.DATA_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    logWarn(`Erreur sauvegarde wallets: ${e.message}`);
+  }
+}
+
+function loadWallets() {
+  try {
+    if (fs.existsSync(CONFIG.DATA_FILE)) {
+      const data = JSON.parse(fs.readFileSync(CONFIG.DATA_FILE, "utf8"));
+      return data;
+    }
+  } catch (e) {
+    logWarn(`Erreur chargement wallets: ${e.message}`);
+  }
+  return {};
+}
+
+// ─── Multi-Wallet Management ────────────────────────────────────────────────
+
+async function addWallet(address, label = "", initialBalance = null) {
+  if (trackedWallets.has(address)) return;
+
+  const balance = initialBalance !== null ? initialBalance : await getBalance(address);
+
+  trackedWallets.set(address, {
+    address,
+    label,
+    balance,
+    accountSubId: null,
+    logsSubId: null,
+    history: [],
+    addedAt: new Date().toISOString(),
+  });
+
+  log(`Wallet ajouté: ${address}${label ? ` (${label})` : ""} | ${(balance / 1e9).toFixed(4)} SOL`);
+
+  // Subscribe on WebSocket
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    await subscribeWallet(address);
+  }
+
+  saveWallets();
+}
+
+function removeWallet(address) {
+  const info = trackedWallets.get(address);
+  if (!info) return;
+
+  // Unsubscribe
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    if (info.accountSubId !== null) {
+      wsSend({ method: "accountUnsubscribe", params: [info.accountSubId] }).catch(() => {});
+    }
+    if (info.logsSubId !== null) {
+      wsSend({ method: "logsUnsubscribe", params: [info.logsSubId] }).catch(() => {});
+    }
+  }
+
+  trackedWallets.delete(address);
+  log(`Wallet supprimé: ${address}`);
+  saveWallets();
+}
+
+async function switchWallet(oldAddress, newAddress, reason) {
+  const info = trackedWallets.get(oldAddress);
+  if (!info) return;
+
+  info.history.push({
+    from: oldAddress,
+    to: newAddress,
+    reason,
+    timestamp: new Date().toISOString(),
+  });
+
+  // Remove old wallet subscriptions
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    if (info.accountSubId !== null) {
+      wsSend({ method: "accountUnsubscribe", params: [info.accountSubId] }).catch(() => {});
+    }
+    if (info.logsSubId !== null) {
+      wsSend({ method: "logsUnsubscribe", params: [info.logsSubId] }).catch(() => {});
+    }
+  }
+
+  // Update the entry to track the new wallet
+  const newBalance = await getBalance(newAddress);
+  const history = info.history;
+  const label = info.label;
+  const addedAt = info.addedAt;
+
+  trackedWallets.delete(oldAddress);
+  trackedWallets.set(newAddress, {
+    address: newAddress,
+    label,
+    balance: newBalance,
+    accountSubId: null,
+    logsSubId: null,
+    history,
+    addedAt,
+  });
+
+  // Subscribe to new wallet
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    await subscribeWallet(newAddress);
+  }
+
+  const msg =
+    `🔄 <b>SWITCH WALLET</b>\n\n` +
+    `📤 De: <code>${oldAddress}</code>\n` +
+    `📥 Vers: <code>${newAddress}</code>\n` +
+    `💰 Nouvelle balance: ${(newBalance / 1e9).toFixed(4)} SOL\n` +
+    `📝 Raison: ${reason}\n` +
+    `🔗 Chaîne: ${history.length} switch(es)`;
+
+  logAlert(`SWITCH: ${oldAddress.slice(0, 8)}... → ${newAddress.slice(0, 8)}...`);
+  log(`Raison: ${reason}`);
+  await sendTelegram(msg);
+
+  saveWallets();
+}
+
 // ─── RPC HTTP Helpers ───────────────────────────────────────────────────────
+
 function buildUrl() {
   const base = CONFIG.RPC_HTTP;
   if (CONFIG.API_KEY) {
@@ -192,7 +557,6 @@ function analyzeTransactionForTransfer(tx, trackedWallet) {
   const preBal = preBalances[walletIndex];
   const postBal = postBalances[walletIndex];
 
-  // Check if the wallet sent almost all its SOL
   if (preBal === 0) return null;
 
   const amountSent = preBal - postBal;
@@ -200,7 +564,6 @@ function analyzeTransactionForTransfer(tx, trackedWallet) {
 
   if (ratio < CONFIG.TRANSFER_THRESHOLD) return null;
 
-  // Find who received the SOL
   let maxReceived = 0;
   let receiverIndex = -1;
 
@@ -217,13 +580,9 @@ function analyzeTransactionForTransfer(tx, trackedWallet) {
 
   const receiver = accountKeys[receiverIndex];
 
-  // Ignore if receiver is a known program
   const knownPrograms = [
-    SYSTEM_PROGRAM,
-    TOKEN_PROGRAM,
-    TOKEN_2022_PROGRAM,
-    ASSOCIATED_TOKEN_PROGRAM,
-    METADATA_PROGRAM,
+    SYSTEM_PROGRAM, TOKEN_PROGRAM, TOKEN_2022_PROGRAM,
+    ASSOCIATED_TOKEN_PROGRAM, METADATA_PROGRAM,
     "ComputeBudget111111111111111111111111111111",
     "SysvarRent111111111111111111111111111111111",
   ];
@@ -258,7 +617,6 @@ function analyzeTransactionForTokenCreation(tx, trackedWallet) {
     ...(tx.meta.innerInstructions || []).flatMap((ix) => ix.instructions || []),
   ];
 
-  // Detect launchpad interactions (for info logging)
   let launchpadUsed = null;
   for (const ix of allInstructions) {
     const programId = ix.programId || accountKeys[ix.programIdIndex];
@@ -267,7 +625,7 @@ function analyzeTransactionForTokenCreation(tx, trackedWallet) {
     }
   }
 
-  // Method 1: Direct initializeMint / initializeMint2 instructions (most reliable)
+  // Method 1: Direct initializeMint / initializeMint2
   for (const ix of allInstructions) {
     const programId = ix.programId || accountKeys[ix.programIdIndex];
 
@@ -290,8 +648,7 @@ function analyzeTransactionForTokenCreation(tx, trackedWallet) {
     }
   }
 
-  // Method 2: createAccount with owner = Token Program + InitializeMint in logs
-  // This catches cases where the mint is created via System Program createAccount
+  // Method 2: createAccount + InitializeMint in logs
   if (tx.meta.logMessages) {
     const hasMintLog = tx.meta.logMessages.some((l) =>
       MINT_LOG_PATTERNS.some((p) => l.includes(p))
@@ -309,7 +666,6 @@ function analyzeTransactionForTokenCreation(tx, trackedWallet) {
             (owner === TOKEN_PROGRAM || owner === TOKEN_2022_PROGRAM) &&
             !foundMints.has(newAccount)
           ) {
-            // Verify this is a mint account (size 82 for SPL Token mint)
             const space = ix.parsed.info?.space;
             if (space === 82 || space === undefined) {
               foundMints.add(newAccount);
@@ -328,8 +684,7 @@ function analyzeTransactionForTokenCreation(tx, trackedWallet) {
     }
   }
 
-  // Method 3: Detect via launchpad + new mint in postTokenBalances
-  // (pump.fun and similar create the mint inside the program)
+  // Method 3: Launchpad + new mint in postTokenBalances
   if (launchpadUsed) {
     const preMints = new Set(
       (tx.meta.preTokenBalances || []).map((b) => b.mint)
@@ -356,34 +711,112 @@ function analyzeTransactionForTokenCreation(tx, trackedWallet) {
   return results.length > 0 ? results : null;
 }
 
-// ─── Wallet Switch ──────────────────────────────────────────────────────────
+async function reportTokenFindings(tx, wallet) {
+  const tokens = analyzeTransactionForTokenCreation(tx, wallet);
+  if (tokens && tokens.length > 0) {
+    for (const token of tokens) {
+      if (token.type === "token_creation") {
+        const launchpadInfo = token.launchpad ? `\n🏪 Plateforme: ${token.launchpad}` : "";
+        const walletInfo = trackedWallets.get(wallet);
+        const labelInfo = walletInfo?.label ? ` (${walletInfo.label})` : "";
 
-async function switchToWallet(newWallet, reason) {
-  const oldWallet = currentWallet;
-  walletHistory.push({
-    wallet: oldWallet,
-    switchedTo: newWallet,
-    reason,
-    timestamp: new Date().toISOString(),
-  });
+        const msg =
+          `🪙 <b>NOUVEAU TOKEN CREE!</b>\n\n` +
+          `📋 Mint: <code>${token.mintAddress}</code>\n` +
+          `🔧 Programme: ${token.program}${launchpadInfo}\n` +
+          `👤 Créateur: <code>${token.creator}</code>${labelInfo}\n` +
+          `🔗 TX: <code>${token.signature.slice(0, 32)}...</code>`;
 
-  logAlert(
-    `SWITCH WALLET: ${oldWallet.slice(0, 8)}...${oldWallet.slice(-4)} → ${newWallet.slice(0, 8)}...${newWallet.slice(-4)}`
-  );
-  log(`Raison: ${reason}`);
-  log(`Historique de suivi: ${walletHistory.length} wallet(s) suivis`);
-  walletHistory.forEach((h, i) => {
-    log(`  ${i + 1}. ${h.wallet} → ${h.switchedTo} (${h.reason})`);
-  });
+        logAlert(
+          `TOKEN CREE!\n` +
+          `  Mint: ${token.mintAddress}\n` +
+          `  Programme: ${token.program}\n` +
+          `  Créateur: ${token.creator}`
+        );
+        await sendTelegram(msg);
+      }
+    }
+  }
+  return tokens;
+}
 
-  currentWallet = newWallet;
-  previousBalance = await getBalance(newWallet);
-  log(
-    `Nouveau wallet: ${newWallet} | Balance: ${(previousBalance / 1e9).toFixed(4)} SOL`
-  );
+// ─── Transaction Scanning ───────────────────────────────────────────────────
 
-  // Re-subscribe on WebSocket
-  await resubscribe();
+async function scanForTokenActivity(walletAddress) {
+  try {
+    const sigs = await getSignaturesForAddress(walletAddress, 3);
+    if (!sigs || sigs.length === 0) return;
+
+    for (const sigInfo of sigs) {
+      if (sigInfo.err) continue;
+      if (reportedSignatures.has(sigInfo.signature)) continue;
+
+      const tx = await getTransaction(sigInfo.signature);
+      if (!tx) continue;
+
+      const tokens = await reportTokenFindings(tx, walletAddress);
+      if (tokens && tokens.length > 0) {
+        reportedSignatures.add(sigInfo.signature);
+      }
+    }
+  } catch (e) {
+    logWarn(`Erreur scan token (${walletAddress.slice(0, 8)}...): ${e.message}`);
+  }
+}
+
+async function analyzeRecentTransactions(walletAddress) {
+  try {
+    const sigs = await getSignaturesForAddress(walletAddress, 10);
+    if (!sigs || sigs.length === 0) {
+      log(`Aucune TX récente pour ${walletAddress.slice(0, 8)}...`);
+      return;
+    }
+
+    for (const sigInfo of sigs) {
+      if (sigInfo.err) continue;
+
+      const tx = await getTransaction(sigInfo.signature);
+      if (!tx) continue;
+
+      // Check for token creation
+      if (!reportedSignatures.has(sigInfo.signature)) {
+        const tokens = await reportTokenFindings(tx, walletAddress);
+        if (tokens && tokens.length > 0) {
+          reportedSignatures.add(sigInfo.signature);
+        }
+      }
+
+      // Check for full SOL transfer
+      const transfer = analyzeTransactionForTransfer(tx, walletAddress);
+      if (transfer) {
+        const walletInfo = trackedWallets.get(walletAddress);
+        const labelInfo = walletInfo?.label ? ` (${walletInfo.label})` : "";
+
+        const msg =
+          `💸 <b>TRANSFERT TOTAL</b>\n\n` +
+          `📤 De: <code>${transfer.from}</code>${labelInfo}\n` +
+          `📥 Vers: <code>${transfer.to}</code>\n` +
+          `💰 Montant: ${transfer.amountSOL.toFixed(4)} SOL (${(transfer.ratio * 100).toFixed(1)}%)\n` +
+          `🔗 TX: <code>${transfer.signature.slice(0, 32)}...</code>`;
+
+        logAlert(`TRANSFERT: ${transfer.from.slice(0, 8)}... → ${transfer.to.slice(0, 8)}...`);
+        await sendTelegram(msg);
+
+        reportedSignatures.clear();
+
+        await switchWallet(
+          walletAddress,
+          transfer.to,
+          `Transfert de ${transfer.amountSOL.toFixed(4)} SOL (${(transfer.ratio * 100).toFixed(1)}%)`
+        );
+        return;
+      }
+    }
+
+    log(`Aucun transfert total pour ${walletAddress.slice(0, 8)}...`);
+  } catch (e) {
+    logWarn(`Erreur analyse TX (${walletAddress.slice(0, 8)}...): ${e.message}`);
+  }
 }
 
 // ─── WebSocket Management ───────────────────────────────────────────────────
@@ -413,60 +846,40 @@ function wsSend(payload) {
   });
 }
 
-async function subscribeAccount(wallet) {
+async function subscribeWallet(address) {
+  const info = trackedWallets.get(address);
+  if (!info) return;
+
   try {
-    const id = await wsSend({
+    await wsSend({
       method: "accountSubscribe",
-      params: [wallet, { encoding: "jsonParsed", commitment: CONFIG.COMMITMENT }],
+      params: [address, { encoding: "jsonParsed", commitment: CONFIG.COMMITMENT }],
     });
-    log(`accountSubscribe envoyé (id=${id}) pour ${wallet.slice(0, 8)}...`);
-    return id;
+    log(`accountSubscribe envoyé pour ${address.slice(0, 8)}...`);
   } catch (e) {
     logWarn(`Erreur accountSubscribe: ${e.message}`);
-    return null;
   }
-}
 
-async function subscribeLogs(wallet) {
   try {
-    const id = await wsSend({
+    await wsSend({
       method: "logsSubscribe",
-      params: [
-        { mentions: [wallet] },
-        { commitment: CONFIG.COMMITMENT },
-      ],
+      params: [{ mentions: [address] }, { commitment: CONFIG.COMMITMENT }],
     });
-    log(`logsSubscribe envoyé (id=${id}) pour ${wallet.slice(0, 8)}...`);
-    return id;
+    log(`logsSubscribe envoyé pour ${address.slice(0, 8)}...`);
   } catch (e) {
     logWarn(`Erreur logsSubscribe: ${e.message}`);
-    return null;
   }
 }
 
-async function unsubscribeAll() {
-  try {
-    if (accountSubId !== null) {
-      await wsSend({ method: "accountUnsubscribe", params: [accountSubId] });
-      accountSubId = null;
-    }
-  } catch (_) {}
-  try {
-    if (logsSubId !== null) {
-      await wsSend({ method: "logsUnsubscribe", params: [logsSubId] });
-      logsSubId = null;
-    }
-  } catch (_) {}
+async function subscribeAllWallets() {
+  for (const address of trackedWallets.keys()) {
+    await subscribeWallet(address);
+  }
 }
 
-async function resubscribe() {
-  await unsubscribeAll();
-  await subscribeAccount(currentWallet);
-  await subscribeLogs(currentWallet);
-}
-
-// Track subscription IDs from server responses
-const pendingSubscriptions = new Map();
+// Map subscription IDs to wallet addresses
+const subIdToWallet = new Map();
+let pendingSubQueue = [];
 
 async function handleWsMessage(data) {
   let msg;
@@ -477,93 +890,104 @@ async function handleWsMessage(data) {
   }
 
   // Handle subscription confirmation
-  if (msg.id && msg.result !== undefined) {
-    if (typeof msg.result === "number") {
-      // This is a subscription ID confirmation
-      if (!accountSubId) {
-        accountSubId = msg.result;
-        logSuccess(`accountSubscribe confirmé (subId=${msg.result})`);
-      } else if (!logsSubId) {
-        logsSubId = msg.result;
-        logSuccess(`logsSubscribe confirmé (subId=${msg.result})`);
+  if (msg.id && msg.result !== undefined && typeof msg.result === "number") {
+    const subId = msg.result;
+    // Assign to pending wallet
+    if (pendingSubQueue.length > 0) {
+      const { address, type } = pendingSubQueue.shift();
+      subIdToWallet.set(subId, { address, type });
+      const info = trackedWallets.get(address);
+      if (info) {
+        if (type === "account") info.accountSubId = subId;
+        else if (type === "logs") info.logsSubId = subId;
       }
+      logSuccess(`${type}Subscribe confirmé pour ${address.slice(0, 8)}... (subId=${subId})`);
     }
     return;
   }
 
   // Handle notifications
   if (msg.method === "accountNotification") {
-    await handleAccountNotification(msg.params);
+    const subId = msg.params?.subscription;
+    const walletInfo = subIdToWallet.get(subId);
+    if (walletInfo) {
+      await handleAccountNotification(walletInfo.address, msg.params);
+    }
   } else if (msg.method === "logsNotification") {
-    await handleLogsNotification(msg.params);
+    const subId = msg.params?.subscription;
+    const walletInfo = subIdToWallet.get(subId);
+    if (walletInfo) {
+      await handleLogsNotification(walletInfo.address, msg.params);
+    }
   }
 }
 
-let isProcessing = false;
+const processingWallets = new Set();
 
-async function handleAccountNotification(params) {
-  if (isProcessing) return;
-  isProcessing = true;
+async function handleAccountNotification(walletAddress, params) {
+  if (processingWallets.has(walletAddress)) return;
+  processingWallets.add(walletAddress);
 
   try {
+    const info = trackedWallets.get(walletAddress);
+    if (!info) return;
+
     const accountInfo = params?.result?.value;
     if (!accountInfo) return;
 
     const newBalance = accountInfo.lamports;
-    const oldBalance = previousBalance;
+    const oldBalance = info.balance;
 
     log(
-      `Balance changée: ${(oldBalance / 1e9).toFixed(4)} → ${(newBalance / 1e9).toFixed(4)} SOL (${currentWallet.slice(0, 8)}...)`
+      `Balance: ${(oldBalance / 1e9).toFixed(4)} → ${(newBalance / 1e9).toFixed(4)} SOL (${walletAddress.slice(0, 8)}...)`
     );
 
-    // Check if balance dropped significantly (sent all SOL)
     if (oldBalance > 0 && newBalance < oldBalance) {
       const ratio = (oldBalance - newBalance) / oldBalance;
 
       if (ratio >= CONFIG.TRANSFER_THRESHOLD) {
-        log("Transfert massif détecté! Analyse des transactions...");
-        previousBalance = newBalance;
-        await analyzeRecentTransactions();
+        log(`Transfert massif détecté! (${walletAddress.slice(0, 8)}...)`);
+        info.balance = newBalance;
+        await analyzeRecentTransactions(walletAddress);
         return;
       }
+
+      // Scan for token activity on balance decrease
+      await scanForTokenActivity(walletAddress);
     }
 
-    // Scan for token activity when balance decreases (spending SOL = potential token creation)
-    if (newBalance < oldBalance) {
-      await scanForTokenActivity();
-    }
-
-    previousBalance = newBalance;
+    info.balance = newBalance;
   } catch (e) {
-    logWarn(`Erreur handleAccountNotification: ${e.message}`);
+    logWarn(`Erreur notification (${walletAddress.slice(0, 8)}...): ${e.message}`);
   } finally {
-    isProcessing = false;
+    processingWallets.delete(walletAddress);
   }
 }
 
-async function handleLogsNotification(params) {
+async function handleLogsNotification(walletAddress, params) {
   const result = params?.result;
   if (!result || !result.value) return;
 
   const { signature, logs } = result.value;
   if (!signature || !logs) return;
 
-  // Check for real token creation patterns in logs
-  const hasTokenCreation = logs.some(
-    (l) =>
-      MINT_LOG_PATTERNS.some((p) => l.includes(p)) ||
-      Object.keys(KNOWN_LAUNCHPADS).some((p) => l.includes(p))
+  if (reportedSignatures.has(signature)) return;
+
+  const hasTokenCreation = logs.some((l) =>
+    MINT_LOG_PATTERNS.some((p) => l.includes(p)) ||
+    Object.keys(KNOWN_LAUNCHPADS).some((p) => l.includes(p))
   );
 
   if (hasTokenCreation) {
-    log(`Possible création de token détectée (sig: ${signature.slice(0, 16)}...)`);
-    // Fetch full transaction for details
+    log(`Possible création de token (${walletAddress.slice(0, 8)}..., sig: ${signature.slice(0, 16)}...)`);
     try {
-      // Small delay to let the transaction finalize
       await sleep(2000);
       const tx = await getTransaction(signature);
       if (tx) {
-        reportTokenFindings(tx, currentWallet);
+        const tokens = await reportTokenFindings(tx, walletAddress);
+        if (tokens && tokens.length > 0) {
+          reportedSignatures.add(signature);
+        }
       }
     } catch (e) {
       logWarn(`Erreur analyse token: ${e.message}`);
@@ -571,99 +995,34 @@ async function handleLogsNotification(params) {
   }
 }
 
-function reportTokenFindings(tx, wallet) {
-  const tokens = analyzeTransactionForTokenCreation(tx, wallet);
-  if (tokens && tokens.length > 0) {
-    for (const token of tokens) {
-      if (token.type === "token_creation") {
-        const launchpadInfo = token.launchpad
-          ? `\n  Plateforme: ${token.launchpad}`
-          : "";
-        logAlert(
-          `NOUVEAU TOKEN CREE!\n` +
-          `  Adresse contrat (Mint): ${token.mintAddress}\n` +
-          `  Programme: ${token.program}${launchpadInfo}\n` +
-          `  Créateur: ${token.creator}\n` +
-          `  Signature TX: ${token.signature}`
-        );
-      }
-    }
-  }
-  return tokens;
-}
+// Override subscribeWallet to track pending subs
+const originalSubscribeWallet = subscribeWallet;
+async function subscribeWalletTracked(address) {
+  const info = trackedWallets.get(address);
+  if (!info) return;
 
-// Track already-reported signatures to avoid duplicates
-const reportedSignatures = new Set();
-
-async function scanForTokenActivity() {
   try {
-    const sigs = await getSignaturesForAddress(currentWallet, 3);
-    if (!sigs || sigs.length === 0) return;
-
-    for (const sigInfo of sigs) {
-      if (sigInfo.err) continue;
-      if (reportedSignatures.has(sigInfo.signature)) continue;
-
-      const tx = await getTransaction(sigInfo.signature);
-      if (!tx) continue;
-
-      const tokens = reportTokenFindings(tx, currentWallet);
-      if (tokens && tokens.length > 0) {
-        reportedSignatures.add(sigInfo.signature);
-      }
-    }
+    pendingSubQueue.push({ address, type: "account" });
+    await wsSend({
+      method: "accountSubscribe",
+      params: [address, { encoding: "jsonParsed", commitment: CONFIG.COMMITMENT }],
+    });
+    log(`accountSubscribe envoyé pour ${address.slice(0, 8)}...`);
   } catch (e) {
-    logWarn(`Erreur scan token: ${e.message}`);
+    pendingSubQueue.pop();
+    logWarn(`Erreur accountSubscribe: ${e.message}`);
   }
-}
 
-async function analyzeRecentTransactions() {
   try {
-    const sigs = await getSignaturesForAddress(currentWallet, 10);
-    if (!sigs || sigs.length === 0) {
-      log("Aucune transaction récente trouvée.");
-      return;
-    }
-
-    for (const sigInfo of sigs) {
-      if (sigInfo.err) continue;
-
-      const tx = await getTransaction(sigInfo.signature);
-      if (!tx) continue;
-
-      // Check for token creation
-      if (!reportedSignatures.has(sigInfo.signature)) {
-        const tokens = reportTokenFindings(tx, currentWallet);
-        if (tokens && tokens.length > 0) {
-          reportedSignatures.add(sigInfo.signature);
-        }
-      }
-
-      // Check for full SOL transfer
-      const transfer = analyzeTransactionForTransfer(tx, currentWallet);
-      if (transfer) {
-        logAlert(
-          `TRANSFERT TOTAL DETECTE!\n` +
-          `  De: ${transfer.from}\n` +
-          `  Vers: ${transfer.to}\n` +
-          `  Montant: ${transfer.amountSOL.toFixed(4)} SOL (${(transfer.ratio * 100).toFixed(1)}% du solde)\n` +
-          `  Signature TX: ${transfer.signature}`
-        );
-
-        // Clear reported sigs for new wallet
-        reportedSignatures.clear();
-
-        await switchToWallet(
-          transfer.to,
-          `Transfert de ${transfer.amountSOL.toFixed(4)} SOL (${(transfer.ratio * 100).toFixed(1)}%)`
-        );
-        return;
-      }
-    }
-
-    log("Aucun transfert total trouvé dans les transactions récentes.");
+    pendingSubQueue.push({ address, type: "logs" });
+    await wsSend({
+      method: "logsSubscribe",
+      params: [{ mentions: [address] }, { commitment: CONFIG.COMMITMENT }],
+    });
+    log(`logsSubscribe envoyé pour ${address.slice(0, 8)}...`);
   } catch (e) {
-    logWarn(`Erreur analyse transactions: ${e.message}`);
+    pendingSubQueue.pop();
+    logWarn(`Erreur logsSubscribe: ${e.message}`);
   }
 }
 
@@ -679,13 +1038,16 @@ function connectWebSocket() {
 
   ws.on("open", async () => {
     logSuccess("WebSocket connecté!");
-    await subscribeAccount(currentWallet);
-    await subscribeLogs(currentWallet);
+    subIdToWallet.clear();
+    pendingSubQueue = [];
+    for (const address of trackedWallets.keys()) {
+      await subscribeWalletTracked(address);
+    }
   });
 
   ws.on("message", (data) => {
     handleWsMessage(data).catch((e) => {
-      logWarn(`Erreur traitement message WS: ${e.message}`);
+      logWarn(`Erreur message WS: ${e.message}`);
     });
   });
 
@@ -693,16 +1055,18 @@ function connectWebSocket() {
     logWarn(`Erreur WebSocket: ${err.message}`);
   });
 
-  ws.on("close", (code, reason) => {
+  ws.on("close", (code) => {
     logWarn(`WebSocket fermé (code=${code}). Reconnexion dans ${CONFIG.RECONNECT_DELAY}ms...`);
-    accountSubId = null;
-    logsSubId = null;
+    subIdToWallet.clear();
+    for (const info of trackedWallets.values()) {
+      info.accountSubId = null;
+      info.logsSubId = null;
+    }
     if (!isShuttingDown) {
       setTimeout(connectWebSocket, CONFIG.RECONNECT_DELAY);
     }
   });
 
-  // Ping to keep alive
   const pingInterval = setInterval(() => {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.ping();
@@ -714,32 +1078,29 @@ function connectWebSocket() {
 
 // ─── Polling Fallback ───────────────────────────────────────────────────────
 
-async function pollBalance() {
+async function pollBalances() {
   if (isShuttingDown) return;
 
-  try {
-    const balance = await getBalance(currentWallet);
-    const oldBalance = previousBalance;
+  for (const [address, info] of trackedWallets) {
+    try {
+      const balance = await getBalance(address);
+      const oldBalance = info.balance;
 
-    if (balance !== oldBalance) {
-      log(
-        `[Poll] Balance changée: ${(oldBalance / 1e9).toFixed(4)} → ${(balance / 1e9).toFixed(4)} SOL`
-      );
-
-      if (oldBalance > 0 && balance < oldBalance) {
-        const ratio = (oldBalance - balance) / oldBalance;
-        if (ratio >= CONFIG.TRANSFER_THRESHOLD) {
-          log("[Poll] Transfert massif détecté! Analyse...");
-          previousBalance = balance;
-          await analyzeRecentTransactions();
-          return;
+      if (balance !== oldBalance) {
+        if (oldBalance > 0 && balance < oldBalance) {
+          const ratio = (oldBalance - balance) / oldBalance;
+          if (ratio >= CONFIG.TRANSFER_THRESHOLD) {
+            log(`[Poll] Transfert massif détecté (${address.slice(0, 8)}...)`);
+            info.balance = balance;
+            await analyzeRecentTransactions(address);
+            continue;
+          }
         }
+        info.balance = balance;
       }
-
-      previousBalance = balance;
+    } catch (e) {
+      // Silent
     }
-  } catch (e) {
-    logWarn(`[Poll] Erreur: ${e.message}`);
   }
 }
 
@@ -752,8 +1113,8 @@ function sleep(ms) {
 function printBanner() {
   console.log(`
 ╔══════════════════════════════════════════════════════════╗
-║          SOLANA WALLET TRACKER BOT                       ║
-║          Powered by FluxRPC                              ║
+║       SOLANA WALLET TRACKER BOT + TELEGRAM              ║
+║       Powered by FluxRPC                                ║
 ╚══════════════════════════════════════════════════════════╝
 `);
 }
@@ -763,31 +1124,39 @@ function printConfig() {
   log(`  RPC HTTP: ${CONFIG.RPC_HTTP}`);
   log(`  RPC WS:   ${CONFIG.RPC_WS}`);
   log(`  API Key:  ${CONFIG.API_KEY ? CONFIG.API_KEY.slice(0, 8) + "..." : "(aucune)"}`);
-  log(`  Seuil transfert: ${(CONFIG.TRANSFER_THRESHOLD * 100).toFixed(0)}%`);
-  log(`  Intervalle polling: ${CONFIG.POLL_INTERVAL}ms`);
-  log(`  Commitment: ${CONFIG.COMMITMENT}`);
+  log(`  Telegram: ${CONFIG.TELEGRAM_BOT_TOKEN ? "✓ configuré" : "✗ non configuré"}`);
+  log(`  Chat ID:  ${CONFIG.TELEGRAM_CHAT_ID || "(auto-détection au 1er message)"}`);
+  log(`  Seuil:    ${(CONFIG.TRANSFER_THRESHOLD * 100).toFixed(0)}%`);
+  log(`  Polling:  ${CONFIG.POLL_INTERVAL}ms`);
   console.log();
 }
 
 function printUsage() {
   console.log(`
-Usage: node index.js <WALLET_ADDRESS>
+Usage: node index.js [WALLET_ADDRESS...]
 
-  ou avec variables d'environnement:
-    TRACK_WALLET=<address> node index.js
+  Ajouter des wallets au démarrage (optionnel).
+  Les wallets peuvent aussi être ajoutés via Telegram: /add <adresse>
 
 Variables d'environnement:
   FLUXRPC_API_KEY       - Clé API FluxRPC (requis)
   FLUXRPC_HTTP          - URL RPC HTTP (défaut: https://eu.fluxrpc.com)
   FLUXRPC_WS            - URL WebSocket (défaut: wss://ws.eu.fluxrpc.com)
-  TRACK_WALLET          - Adresse du wallet à suivre
-  TRANSFER_THRESHOLD    - Seuil de transfert (défaut: 0.95 = 95%)
-  POLL_INTERVAL         - Intervalle de polling en ms (défaut: 5000)
-  RECONNECT_DELAY       - Délai de reconnexion WS en ms (défaut: 3000)
-  COMMITMENT            - Niveau de commitment (défaut: confirmed)
+  TELEGRAM_BOT_TOKEN    - Token du bot Telegram (requis pour Telegram)
+  TELEGRAM_CHAT_ID      - ID du chat Telegram (auto-détecté si vide)
+  TRANSFER_THRESHOLD    - Seuil de transfert (défaut: 0.95)
+  POLL_INTERVAL         - Intervalle polling en ms (défaut: 5000)
+  COMMITMENT            - Niveau commitment (défaut: confirmed)
 
-Exemple:
-  FLUXRPC_API_KEY=your-key node index.js 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU
+Exemples:
+  # Avec Telegram uniquement (ajouter wallets via /add)
+  FLUXRPC_API_KEY=xxx TELEGRAM_BOT_TOKEN=yyy node index.js
+
+  # Avec wallets en CLI + Telegram
+  FLUXRPC_API_KEY=xxx TELEGRAM_BOT_TOKEN=yyy node index.js wallet1 wallet2
+
+  # Sans Telegram (console uniquement)
+  FLUXRPC_API_KEY=xxx node index.js wallet1
 `);
 }
 
@@ -796,62 +1165,94 @@ Exemple:
 async function main() {
   printBanner();
 
-  if (!CONFIG.INITIAL_WALLET) {
+  if (!CONFIG.API_KEY) {
     printUsage();
+    logWarn("FLUXRPC_API_KEY est requis!");
     process.exit(1);
   }
 
-  currentWallet = CONFIG.INITIAL_WALLET;
   printConfig();
 
-  // Validate wallet address format (base58, 32-44 chars)
-  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(currentWallet)) {
-    logWarn("L'adresse du wallet ne semble pas valide (format base58 attendu).");
-    process.exit(1);
+  // Load saved wallets
+  const savedWallets = loadWallets();
+  for (const [addr, data] of Object.entries(savedWallets)) {
+    try {
+      const balance = await getBalance(addr);
+      trackedWallets.set(addr, {
+        address: addr,
+        label: data.label || "",
+        balance,
+        accountSubId: null,
+        logsSubId: null,
+        history: data.history || [],
+        addedAt: data.addedAt || new Date().toISOString(),
+      });
+      log(`Wallet restauré: ${addr.slice(0, 8)}... | ${(balance / 1e9).toFixed(4)} SOL`);
+    } catch (e) {
+      logWarn(`Impossible de restaurer ${addr.slice(0, 8)}...: ${e.message}`);
+    }
   }
 
-  log(`Démarrage du suivi: ${currentWallet}`);
-
-  // Get initial balance
-  try {
-    previousBalance = await getBalance(currentWallet);
-    logSuccess(
-      `Balance initiale: ${(previousBalance / 1e9).toFixed(4)} SOL`
-    );
-  } catch (e) {
-    logWarn(`Impossible de récupérer la balance: ${e.message}`);
-    logWarn("Vérifiez votre clé API et la connexion réseau.");
-    process.exit(1);
+  // Add CLI wallets
+  const cliWallets = process.argv.slice(2).filter((a) => /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(a));
+  for (const addr of cliWallets) {
+    if (!trackedWallets.has(addr)) {
+      try {
+        const balance = await getBalance(addr);
+        await addWallet(addr, "", balance);
+      } catch (e) {
+        logWarn(`Erreur ajout ${addr.slice(0, 8)}...: ${e.message}`);
+      }
+    }
   }
 
-  // Connect WebSocket for real-time updates
+  if (trackedWallets.size > 0) {
+    logSuccess(`${trackedWallets.size} wallet(s) en cours de suivi`);
+  } else {
+    log("Aucun wallet à suivre. Ajoutez-en via Telegram (/add) ou en CLI.");
+  }
+
+  // Connect WebSocket
   connectWebSocket();
 
-  // Start polling as fallback
-  log("Démarrage du polling de secours...");
-  setInterval(pollBalance, CONFIG.POLL_INTERVAL);
+  // Start polling fallback
+  setInterval(pollBalances, CONFIG.POLL_INTERVAL);
 
-  log("Bot en cours d'exécution. Appuyez sur Ctrl+C pour arrêter.\n");
+  // Start Telegram polling
+  if (CONFIG.TELEGRAM_BOT_TOKEN) {
+    log("Démarrage polling Telegram...");
+    setInterval(pollTelegram, CONFIG.TELEGRAM_POLL_INTERVAL);
+
+    // Send startup message
+    if (CONFIG.TELEGRAM_CHAT_ID) {
+      const walletCount = trackedWallets.size;
+      await sendTelegram(
+        `🟢 <b>Bot démarré</b>\n` +
+        `👛 ${walletCount} wallet(s) en suivi\n` +
+        `Tapez /help pour les commandes`
+      );
+    }
+  } else {
+    log("Telegram non configuré (TELEGRAM_BOT_TOKEN manquant)");
+  }
+
+  log("Bot en cours d'exécution. Ctrl+C pour arrêter.\n");
 }
 
 // ─── Graceful Shutdown ──────────────────────────────────────────────────────
 
-process.on("SIGINT", () => {
+process.on("SIGINT", async () => {
   console.log();
   log("Arrêt du bot...");
   isShuttingDown = true;
 
-  if (walletHistory.length > 0) {
-    log("Historique de suivi:");
-    walletHistory.forEach((h, i) => {
-      log(`  ${i + 1}. ${h.wallet} → ${h.switchedTo} (${h.reason}) [${h.timestamp}]`);
-    });
+  if (CONFIG.TELEGRAM_BOT_TOKEN && CONFIG.TELEGRAM_CHAT_ID) {
+    await sendTelegram("🔴 <b>Bot arrêté</b>");
   }
 
-  if (ws) {
-    ws.close();
-  }
+  if (ws) ws.close();
 
+  saveWallets();
   log("Au revoir!");
   process.exit(0);
 });
