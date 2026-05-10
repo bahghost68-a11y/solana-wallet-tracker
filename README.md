@@ -131,6 +131,38 @@ Le bot envoie des notifications pour :
 - 🔄 **Switch wallet** — quand le bot commence à suivre un nouveau wallet
 - 🟢 **Bot démarré** / 🔴 **Bot arrêté**
 
+## Déploiement sur Railway (24/7)
+
+### 1. Créer un projet Railway
+
+1. Allez sur [railway.app](https://railway.app) et connectez votre compte GitHub
+2. Cliquez **"New Project"** → **"Deploy from GitHub Repo"**
+3. Sélectionnez le repo `solana-wallet-tracker`
+4. Railway détecte automatiquement Node.js
+
+### 2. Configurer les variables d'environnement
+
+Dans les **Settings** du service, ajoutez ces variables :
+
+| Variable | Valeur |
+|---|---|
+| `FLUXRPC_API_KEY` | Votre clé API FluxRPC |
+| `TELEGRAM_BOT_TOKEN` | Token de votre bot Telegram |
+| `TELEGRAM_CHAT_ID` | Votre chat ID Telegram |
+
+### 3. Vérifier le déploiement
+
+- Railway va installer les dépendances et lancer `node index.js` automatiquement (via le `Procfile`)
+- Le bot utilise un **worker** (pas un serveur web), il n'a pas besoin de port
+- Vérifiez les logs dans Railway pour confirmer que le bot est connecté
+- Envoyez `/status` au bot Telegram pour vérifier qu'il tourne
+
+### 4. Gestion
+
+- Les wallets sont gérés via Telegram (`/add`, `/remove`, `/list`)
+- Le fichier `wallets.json` est recréé au redémarrage — les wallets ajoutés via Telegram sont persistés tant que le service tourne
+- Pour un redémarrage, ré-ajoutez vos wallets via `/add` (ou utilisez les variables d'env pour passer des wallets en CLI)
+
 ## Licence
 
 MIT
