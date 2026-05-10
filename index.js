@@ -454,6 +454,26 @@ async function switchWallet(oldAddress, newAddress, reason) {
   await sendTelegram(msg);
 
   saveWallets();
+
+  // Scan recent transactions of the new wallet to catch token creation that
+  // may have happened right after the transfer (before WebSocket is subscribed)
+  log(`Scan des transactions récentes de ${newAddress.slice(0, 8)}...`);
+  await sleep(3000);
+  await scanForTokenActivity(newAddress);
+
+  // Schedule delayed re-scans to catch token creation that happens seconds later
+  setTimeout(async () => {
+    log(`Re-scan (10s) de ${newAddress.slice(0, 8)}...`);
+    await scanForTokenActivity(newAddress);
+  }, 10000);
+  setTimeout(async () => {
+    log(`Re-scan (30s) de ${newAddress.slice(0, 8)}...`);
+    await scanForTokenActivity(newAddress);
+  }, 30000);
+  setTimeout(async () => {
+    log(`Re-scan (60s) de ${newAddress.slice(0, 8)}...`);
+    await scanForTokenActivity(newAddress);
+  }, 60000);
 }
 
 // ─── RPC HTTP Helpers ───────────────────────────────────────────────────────
@@ -739,7 +759,7 @@ async function reportTokenFindings(tx, wallet) {
 
 async function scanForTokenActivity(walletAddress) {
   try {
-    const sigs = await getSignaturesForAddress(walletAddress, 3);
+    const sigs = await getSignaturesForAddress(walletAddress, 10);
     if (!sigs || sigs.length === 0) return;
 
     for (const sigInfo of sigs) {
