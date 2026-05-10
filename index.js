@@ -606,6 +606,7 @@ function analyzeTransactionForTokenCreation(tx, trackedWallet) {
     typeof k === "string" ? k : k.pubkey
   );
 
+  // Check if wallet is involved (as account or fee payer)
   const walletIndex = accountKeys.indexOf(trackedWallet);
   if (walletIndex === -1) return null;
 
@@ -617,6 +618,7 @@ function analyzeTransactionForTokenCreation(tx, trackedWallet) {
     ...(tx.meta.innerInstructions || []).flatMap((ix) => ix.instructions || []),
   ];
 
+  // Detect launchpad (for info display)
   let launchpadUsed = null;
   for (const ix of allInstructions) {
     const programId = ix.programId || accountKeys[ix.programIdIndex];
@@ -625,7 +627,7 @@ function analyzeTransactionForTokenCreation(tx, trackedWallet) {
     }
   }
 
-  // Method 1: Direct initializeMint / initializeMint2
+  // Method 1: Direct initializeMint / initializeMint2 instructions
   for (const ix of allInstructions) {
     const programId = ix.programId || accountKeys[ix.programIdIndex];
 
@@ -648,63 +650,56 @@ function analyzeTransactionForTokenCreation(tx, trackedWallet) {
     }
   }
 
-  // Method 2: createAccount + InitializeMint in logs
-  if (tx.meta.logMessages) {
-    const hasMintLog = tx.meta.logMessages.some((l) =>
-      MINT_LOG_PATTERNS.some((p) => l.includes(p))
-    );
-
-    if (hasMintLog) {
-      for (const ix of allInstructions) {
-        const programId = ix.programId || accountKeys[ix.programIdIndex];
-        if (programId === SYSTEM_PROGRAM && ix.parsed?.type === "createAccount") {
-          const newAccount = ix.parsed.info?.newAccount;
-          const owner = ix.parsed.info?.owner;
-          if (
-            newAccount &&
-            newAccount !== WRAPPED_SOL &&
-            (owner === TOKEN_PROGRAM || owner === TOKEN_2022_PROGRAM) &&
-            !foundMints.has(newAccount)
-          ) {
-            const space = ix.parsed.info?.space;
-            if (space === 82 || space === undefined) {
-              foundMints.add(newAccount);
-              results.push({
-                type: "token_creation",
-                mintAddress: newAccount,
-                program: owner === TOKEN_PROGRAM ? "SPL Token" : "Token-2022",
-                creator: trackedWallet,
-                signature: tx.transaction.signatures[0],
-                launchpad: launchpadUsed,
-              });
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // Method 3: Launchpad + new mint in postTokenBalances
-  if (launchpadUsed) {
-    const preMints = new Set(
-      (tx.meta.preTokenBalances || []).map((b) => b.mint)
-    );
-    for (const tb of tx.meta.postTokenBalances || []) {
+  // Method 2: createAccount with owner = Token Program where the new account
+  // appears as a mint in postTokenBalances (confirms it's a mint, not just a token account)
+  const postMintSet = new Set(
+    (tx.meta.postTokenBalances || []).map((b) => b.mint)
+  );
+  for (const ix of allInstructions) {
+    const programId = ix.programId || accountKeys[ix.programIdIndex];
+    if (programId === SYSTEM_PROGRAM && ix.parsed?.type === "createAccount") {
+      const newAccount = ix.parsed.info?.newAccount;
+      const owner = ix.parsed.info?.owner;
       if (
-        !preMints.has(tb.mint) &&
-        tb.mint !== WRAPPED_SOL &&
-        !foundMints.has(tb.mint)
+        newAccount &&
+        newAccount !== WRAPPED_SOL &&
+        (owner === TOKEN_PROGRAM || owner === TOKEN_2022_PROGRAM) &&
+        postMintSet.has(newAccount) &&
+        !foundMints.has(newAccount)
       ) {
-        foundMints.add(tb.mint);
+        foundMints.add(newAccount);
         results.push({
           type: "token_creation",
-          mintAddress: tb.mint,
-          program: tb.programId || "unknown",
+          mintAddress: newAccount,
+          program: owner === TOKEN_PROGRAM ? "SPL Token" : "Token-2022",
           creator: trackedWallet,
           signature: tx.transaction.signatures[0],
           launchpad: launchpadUsed,
         });
       }
+    }
+  }
+
+  // Method 3: New mints in postTokenBalances that don't exist in preTokenBalances
+  // This is the most reliable method - works for ANY token creation (direct, CPI, launchpad)
+  const preMints = new Set(
+    (tx.meta.preTokenBalances || []).map((b) => b.mint)
+  );
+  for (const tb of tx.meta.postTokenBalances || []) {
+    if (
+      !preMints.has(tb.mint) &&
+      tb.mint !== WRAPPED_SOL &&
+      !foundMints.has(tb.mint)
+    ) {
+      foundMints.add(tb.mint);
+      results.push({
+        type: "token_creation",
+        mintAddress: tb.mint,
+        program: tb.programId || "unknown",
+        creator: trackedWallet,
+        signature: tx.transaction.signatures[0],
+        launchpad: launchpadUsed,
+      });
     }
   }
 
@@ -942,6 +937,7 @@ async function handleAccountNotification(walletAddress, params) {
       `Balance: ${(oldBalance / 1e9).toFixed(4)} → ${(newBalance / 1e9).toFixed(4)} SOL (${walletAddress.slice(0, 8)}...)`
     );
 
+    // Check for massive transfer (wallet emptied)
     if (oldBalance > 0 && newBalance < oldBalance) {
       const ratio = (oldBalance - newBalance) / oldBalance;
 
@@ -951,8 +947,10 @@ async function handleAccountNotification(walletAddress, params) {
         await analyzeRecentTransactions(walletAddress);
         return;
       }
+    }
 
-      // Scan for token activity on balance decrease
+    // Scan for token activity on any balance change
+    if (newBalance !== oldBalance) {
       await scanForTokenActivity(walletAddress);
     }
 
@@ -973,9 +971,13 @@ async function handleLogsNotification(walletAddress, params) {
 
   if (reportedSignatures.has(signature)) return;
 
+  // Broader detection: mint patterns, launchpad programs, or token program invocations
   const hasTokenCreation = logs.some((l) =>
     MINT_LOG_PATTERNS.some((p) => l.includes(p)) ||
-    Object.keys(KNOWN_LAUNCHPADS).some((p) => l.includes(p))
+    Object.keys(KNOWN_LAUNCHPADS).some((p) => l.includes(p)) ||
+    l.includes(TOKEN_PROGRAM) ||
+    l.includes(TOKEN_2022_PROGRAM) ||
+    l.includes("Program log: Instruction: Create")
   );
 
   if (hasTokenCreation) {
