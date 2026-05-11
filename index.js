@@ -5,6 +5,7 @@ const https = require("https");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const entryTracker = require("./entryTracker");
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 const CONFIG = {
@@ -201,16 +202,21 @@ async function handleTelegramCommand(text, chatId) {
     case "/help":
       await sendTelegram(
         "📖 <b>Aide</b>\n\n" +
-        "<b>Commandes:</b>\n" +
+        "<b>Commandes Wallet:</b>\n" +
         "/add <code>&lt;adresse&gt;</code> [label] — Ajouter un wallet\n" +
         "/remove <code>&lt;adresse&gt;</code> — Supprimer un wallet\n" +
         "/list — Liste des wallets suivis\n" +
         "/status — État du bot\n\n" +
+        "<b>Commandes Entry Tracker:</b>\n" +
+        "/pools — Pools détectés récemment\n" +
+        "/check <code>&lt;mint&gt;</code> — Vérifier la sécurité d'un token\n" +
+        "/entry — Config de l'entry tracker\n\n" +
         "<b>Fonctionnement:</b>\n" +
-        "• Le bot surveille les wallets en temps réel\n" +
-        "• Si un wallet envoie tout son SOL → suit le nouveau wallet\n" +
-        "• Si un wallet crée un token → envoie l'adresse contrat\n" +
-        "• La chaîne de suivi est automatique et infinie",
+        "• Suivi wallets en temps réel + chain-following\n" +
+        "• Détection création de tokens\n" +
+        "• Entry Tracker: détecte nouveaux pools Raydium/Pump.fun\n" +
+        "• Alerte VolumeSpike si >50 acheteurs uniques en 10s\n" +
+        "• Vérification sécurité (Mint Authority + LP burn)",
         chatId
       );
       break;
@@ -315,10 +321,14 @@ async function handleTelegramCommand(text, chatId) {
       break;
     }
 
-    default:
-      if (text.startsWith("/")) {
+    default: {
+      // Try entry tracker commands
+      const handled = await entryTracker.handleCommand(command, parts, chatId);
+      if (!handled && text.startsWith("/")) {
         await sendTelegram("❓ Commande inconnue. Tapez /help pour l'aide.", chatId);
       }
+      break;
+    }
   }
 }
 
@@ -931,7 +941,16 @@ async function handleWsMessage(data) {
   } else if (msg.method === "logsNotification") {
     const subId = msg.params?.subscription;
     const walletInfo = subIdToWallet.get(subId);
-    if (walletInfo) {
+    if (walletInfo && walletInfo.type === "entry_logs") {
+      // Entry tracker log notification
+      const result = msg.params?.result;
+      if (result && result.value) {
+        const { signature, logs } = result.value;
+        if (signature && logs) {
+          await entryTracker.handleLogNotification(signature, logs);
+        }
+      }
+    } else if (walletInfo) {
       await handleLogsNotification(walletInfo.address, msg.params);
     }
   }
@@ -1065,6 +1084,10 @@ function connectWebSocket() {
     for (const address of trackedWallets.keys()) {
       await subscribeWalletTracked(address);
     }
+    // Subscribe entry tracker to pool programs
+    if (entryTracker.ENTRY_CONFIG.ENABLED) {
+      await entryTracker.subscribeToPrograms();
+    }
   });
 
   ws.on("message", (data) => {
@@ -1150,6 +1173,11 @@ function printConfig() {
   log(`  Chat ID:  ${CONFIG.TELEGRAM_CHAT_ID || "(auto-détection au 1er message)"}`);
   log(`  Seuil:    ${(CONFIG.TRANSFER_THRESHOLD * 100).toFixed(0)}%`);
   log(`  Polling:  ${CONFIG.POLL_INTERVAL}ms`);
+  log(`  Entry Tracker: ${entryTracker.ENTRY_CONFIG.ENABLED ? "✓ activé" : "✗ désactivé"}`);
+  if (entryTracker.ENTRY_CONFIG.ENABLED) {
+    log(`    Volume: ${entryTracker.ENTRY_CONFIG.VOLUME_THRESHOLD} acheteurs / ${entryTracker.ENTRY_CONFIG.VOLUME_WINDOW_MS / 1000}s`);
+    log(`    Auto-achat: ${entryTracker.ENTRY_CONFIG.AUTO_BUY ? "✓" : "✗"}`);
+  }
   console.log();
 }
 
@@ -1169,6 +1197,13 @@ Variables d'environnement:
   TRANSFER_THRESHOLD    - Seuil de transfert (défaut: 0.95)
   POLL_INTERVAL         - Intervalle polling en ms (défaut: 5000)
   COMMITMENT            - Niveau commitment (défaut: confirmed)
+  ENTRY_TRACKER         - Activer entry tracker (défaut: true, false pour désactiver)
+  VOLUME_THRESHOLD      - Acheteurs uniques pour VolumeSpike (défaut: 50)
+  VOLUME_WINDOW_MS      - Fenêtre glissante en ms (défaut: 10000)
+  BUY_AMOUNT_SOL        - Montant d'achat en SOL (défaut: 0.1)
+  AUTO_BUY              - Auto-achat activé (défaut: false)
+  BASE_SLIPPAGE_BPS     - Slippage de base en bps (défaut: 500)
+  MAX_SLIPPAGE_BPS      - Slippage max en bps (défaut: 3000)
 
 Exemples:
   # Avec Telegram uniquement (ajouter wallets via /add)
@@ -1232,6 +1267,23 @@ async function main() {
     logSuccess(`${trackedWallets.size} wallet(s) en cours de suivi`);
   } else {
     log("Aucun wallet à suivre. Ajoutez-en via Telegram (/add) ou en CLI.");
+  }
+
+  // Initialize entry tracker module
+  entryTracker.init({
+    config: CONFIG,
+    wsSend,
+    rpcCall,
+    sendTelegram,
+    log,
+    logWarn,
+    logSuccess,
+    logAlert,
+    pendingSubQueue,
+  });
+
+  if (entryTracker.ENTRY_CONFIG.ENABLED) {
+    log("Entry Tracker activé — surveillance Raydium + Pump.fun");
   }
 
   // Connect WebSocket

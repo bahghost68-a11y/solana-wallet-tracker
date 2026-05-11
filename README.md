@@ -1,6 +1,6 @@
 # Solana Wallet Tracker Bot
 
-Bot de suivi automatique de wallets Solana avec **Telegram**, détection de création de tokens et multi-wallet. Conçu pour **Termux**, alimenté par **FluxRPC**.
+Bot de suivi automatique de wallets Solana avec **Telegram**, détection de création de tokens, multi-wallet, et **Entry Tracker** (détection de nouveaux pools + sniping). Conçu pour **Termux**, alimenté par **FluxRPC**.
 
 ## Fonctionnalités
 
@@ -13,6 +13,14 @@ Bot de suivi automatique de wallets Solana avec **Telegram**, détection de cré
 - **Polling de secours** : en cas de déconnexion WebSocket, un polling HTTP prend le relais
 - **Reconnexion automatique**
 
+### Entry Tracker (Sniping)
+
+- **Détection de nouveaux pools** Raydium AMM et Pump.fun via `logsSubscribe`
+- **Rolling Window** : surveille les transactions d'achat — si >50 acheteurs uniques en <10 secondes, déclenche un événement **VolumeSpike**
+- **Vérification de sécurité** : vérifie que le Mint Authority est null (pas de création infinie) et que les LP tokens sont brûlés
+- **Signal d'achat** avec slippage dynamique (ajusté selon le volume et l'âge du pool)
+- **Commandes Telegram** : `/pools`, `/check`, `/entry`
+
 ## Commandes Telegram
 
 | Commande | Description |
@@ -23,6 +31,9 @@ Bot de suivi automatique de wallets Solana avec **Telegram**, détection de cré
 | `/list` | Voir tous les wallets suivis avec leurs balances |
 | `/status` | État du bot (WebSocket, uptime, etc.) |
 | `/help` | Afficher l'aide |
+| `/pools` | Pools détectés récemment (Entry Tracker) |
+| `/check <mint>` | Vérifier la sécurité d'un token (Mint Authority) |
+| `/entry` | Configuration de l'Entry Tracker |
 
 ## Prérequis
 
@@ -65,6 +76,13 @@ npm install
 | `POLL_INTERVAL` | Intervalle polling (ms) | `5000` |
 | `RECONNECT_DELAY` | Délai reconnexion WebSocket (ms) | `3000` |
 | `COMMITMENT` | Commitment Solana | `confirmed` |
+| `ENTRY_TRACKER` | Activer l'entry tracker | `true` |
+| `VOLUME_THRESHOLD` | Acheteurs uniques pour VolumeSpike | `50` |
+| `VOLUME_WINDOW_MS` | Fenêtre glissante (ms) | `10000` |
+| `BUY_AMOUNT_SOL` | Montant d'achat par signal | `0.1` |
+| `AUTO_BUY` | Auto-achat activé | `false` |
+| `BASE_SLIPPAGE_BPS` | Slippage de base (bps) | `500` |
+| `MAX_SLIPPAGE_BPS` | Slippage maximum (bps) | `3000` |
 
 ## Utilisation
 
@@ -130,6 +148,10 @@ Le bot envoie des notifications pour :
 - 💸 **Transfert total** — quand un wallet envoie ≥95% de ses SOL
 - 🔄 **Switch wallet** — quand le bot commence à suivre un nouveau wallet
 - 🟢 **Bot démarré** / 🔴 **Bot arrêté**
+- 🆕 **Nouveau pool détecté** — Raydium ou Pump.fun avec adresse du token
+- 🔥 **Volume Spike** — quand >50 acheteurs uniques en <10s
+- 🛭 **Signal d'achat** — si la sécurité est OK (Mint Authority null + LP brûlé)
+- ⚠️ **Alerte sécurité** — si le token échoue les vérifications
 
 ## Déploiement sur Railway (24/7)
 
