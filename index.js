@@ -149,8 +149,10 @@ async function sendTelegram(text, chatId = null) {
   }
 }
 
+let telegramPolling = false;
 async function pollTelegram() {
-  if (!CONFIG.TELEGRAM_BOT_TOKEN || isShuttingDown) return;
+  if (!CONFIG.TELEGRAM_BOT_TOKEN || isShuttingDown || telegramPolling) return;
+  telegramPolling = true;
 
   try {
     const result = await telegramRequest("getUpdates", {
@@ -178,6 +180,8 @@ async function pollTelegram() {
     }
   } catch (e) {
     // Silently ignore polling errors
+  } finally {
+    telegramPolling = false;
   }
 }
 
