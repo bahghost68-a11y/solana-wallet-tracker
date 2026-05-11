@@ -21,6 +21,16 @@ Bot de suivi automatique de wallets Solana avec **Telegram**, détection de cré
 - **Signal d'achat** avec slippage dynamique (ajusté selon le volume et l'âge du pool)
 - **Commandes Telegram** : `/pools`, `/check`, `/entry`
 
+### Bundle Tracker (Jito Detection)
+
+- **Détection en temps réel** des lancements Pump.fun via `logsSubscribe`
+- **Analyse de bloc** : vérifie si la transaction de création est incluse dans un **Jito Bundle** (Block 0 sniping)
+- **Détection Jito** : identifie les transactions séquentielles + paiements aux Jito Tip Accounts
+- **Calcul** du pourcentage de supply acheté dans le bundle et du montant du Tip
+- **Output console coloré** : `[STANDARD LAUNCH]` ou `🚨 [JITO BUNDLE DETECTED]`
+- **Cache avec TTL** (5 min) + backoff algorithmique sur rate limiting
+- **Commandes Telegram** : `/bundle`, `/bundles`, `/analyze`
+
 ## Commandes Telegram
 
 | Commande | Description |
@@ -34,6 +44,9 @@ Bot de suivi automatique de wallets Solana avec **Telegram**, détection de cré
 | `/pools` | Pools détectés récemment (Entry Tracker) |
 | `/check <mint>` | Vérifier la sécurité d'un token (Mint Authority) |
 | `/entry` | Configuration de l'Entry Tracker |
+| `/bundle` | Stats du Bundle Tracker (Jito) |
+| `/bundles` | Jito Bundles détectés récemment |
+| `/analyze <tx_sig>` | Analyser une TX manuellement pour Jito bundle |
 
 ## Prérequis
 
@@ -83,6 +96,7 @@ npm install
 | `AUTO_BUY` | Auto-achat activé | `false` |
 | `BASE_SLIPPAGE_BPS` | Slippage de base (bps) | `500` |
 | `MAX_SLIPPAGE_BPS` | Slippage maximum (bps) | `3000` |
+| `BUNDLE_TRACKER` | Activer le bundle tracker Jito | `true` |
 
 ## Utilisation
 
@@ -152,6 +166,8 @@ Le bot envoie des notifications pour :
 - 🔥 **Volume Spike** — quand >50 acheteurs uniques en <10s
 - 🛭 **Signal d'achat** — si la sécurité est OK (Mint Authority null + LP brûlé)
 - ⚠️ **Alerte sécurité** — si le token échoue les vérifications
+- 🚨 **Jito Bundle détecté** — Block 0 sniping avec détails (supply %, tip SOL)
+- ✅ **Lancement standard** — création Pump.fun sans bundle
 
 ## Déploiement sur Railway (24/7)
 

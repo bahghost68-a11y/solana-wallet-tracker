@@ -1,15 +1,22 @@
 {
   "name": "solana-wallet-tracker",
-  "version": "1.0.0",
-  "description": "Bot de suivi de wallets Solana avec chain-following et détection de création de tokens - Compatible Termux",
+  "version": "2.0.0",
+  "description": "Bot Solana: wallet tracker + entry tracker (sniping) + bundle detector (Jito) - Compatible Termux",
   "main": "index.js",
   "scripts": {
+    "build": "tsc",
+    "prestart": "npm run build 2>/dev/null || true",
     "start": "node index.js",
     "lint": "echo 'No linter configured'"
   },
-  "keywords": ["solana", "wallet", "tracker", "bot", "termux", "fluxrpc"],
+  "keywords": ["solana", "wallet", "tracker", "bot", "termux", "fluxrpc", "sniping", "jito", "pumpfun"],
   "license": "MIT",
   "dependencies": {
+    "@solana/web3.js": "^1.98.0",
+    "dotenv": "^16.4.7",
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
   }
 }

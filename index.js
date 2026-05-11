@@ -6,6 +6,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const entryTracker = require("./entryTracker");
+const bundleTracker = require("./bundleTracker");
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 const CONFIG = {
@@ -215,11 +216,15 @@ async function handleTelegramCommand(text, chatId) {
         "/pools — Pools détectés récemment\n" +
         "/check <code>&lt;mint&gt;</code> — Vérifier la sécurité d'un token\n" +
         "/entry — Config de l'entry tracker\n\n" +
+        "<b>Commandes Bundle Tracker:</b>\n" +
+        "/bundle — Stats du bundle tracker\n" +
+        "/bundles — Jito bundles détectés\n" +
+        "/analyze <code>&lt;tx_sig&gt;</code> — Analyser une TX manuellement\n\n" +
         "<b>Fonctionnement:</b>\n" +
         "• Suivi wallets en temps réel + chain-following\n" +
         "• Détection création de tokens\n" +
-        "• Entry Tracker: détecte nouveaux pools Raydium/Pump.fun\n" +
-        "• Alerte VolumeSpike si >50 acheteurs uniques en 10s\n" +
+        "• Entry Tracker: pools Raydium/Pump.fun + VolumeSpike\n" +
+        "• Bundle Tracker: détecte Jito bundles (Block 0 sniping)\n" +
         "• Vérification sécurité (Mint Authority + LP burn)",
         chatId
       );
@@ -326,8 +331,9 @@ async function handleTelegramCommand(text, chatId) {
     }
 
     default: {
-      // Try entry tracker commands
-      const handled = await entryTracker.handleCommand(command, parts, chatId);
+      // Try entry tracker commands, then bundle tracker
+      let handled = await entryTracker.handleCommand(command, parts, chatId);
+      if (!handled) handled = await bundleTracker.handleCommand(command, parts, chatId);
       if (!handled && text.startsWith("/")) {
         await sendTelegram("❓ Commande inconnue. Tapez /help pour l'aide.", chatId);
       }
@@ -954,6 +960,15 @@ async function handleWsMessage(data) {
           await entryTracker.handleLogNotification(signature, logs);
         }
       }
+    } else if (walletInfo && walletInfo.type === "bundle_logs") {
+      // Bundle tracker log notification
+      const result = msg.params?.result;
+      if (result && result.value) {
+        const { signature, logs } = result.value;
+        if (signature && logs) {
+          await bundleTracker.handleLogNotification(signature, logs);
+        }
+      }
     } else if (walletInfo) {
       await handleLogsNotification(walletInfo.address, msg.params);
     }
@@ -1092,6 +1107,10 @@ function connectWebSocket() {
     if (entryTracker.ENTRY_CONFIG.ENABLED) {
       await entryTracker.subscribeToPrograms();
     }
+    // Subscribe bundle tracker to Pump.fun
+    if (bundleTracker.enabled) {
+      await bundleTracker.subscribeToPumpFun();
+    }
   });
 
   ws.on("message", (data) => {
@@ -1182,6 +1201,7 @@ function printConfig() {
     log(`    Volume: ${entryTracker.ENTRY_CONFIG.VOLUME_THRESHOLD} acheteurs / ${entryTracker.ENTRY_CONFIG.VOLUME_WINDOW_MS / 1000}s`);
     log(`    Auto-achat: ${entryTracker.ENTRY_CONFIG.AUTO_BUY ? "✓" : "✗"}`);
   }
+  log(`  Bundle Tracker: ${bundleTracker.enabled ? "✓ activé" : "✗ désactivé"}`);
   console.log();
 }
 
@@ -1208,6 +1228,7 @@ Variables d'environnement:
   AUTO_BUY              - Auto-achat activé (défaut: false)
   BASE_SLIPPAGE_BPS     - Slippage de base en bps (défaut: 500)
   MAX_SLIPPAGE_BPS      - Slippage max en bps (défaut: 3000)
+  BUNDLE_TRACKER        - Activer bundle tracker Jito (défaut: true)
 
 Exemples:
   # Avec Telegram uniquement (ajouter wallets via /add)
@@ -1288,6 +1309,23 @@ async function main() {
 
   if (entryTracker.ENTRY_CONFIG.ENABLED) {
     log("Entry Tracker activé — surveillance Raydium + Pump.fun");
+  }
+
+  // Initialize bundle tracker module
+  bundleTracker.init({
+    config: CONFIG,
+    wsSend,
+    rpcCall,
+    sendTelegram,
+    log,
+    logWarn,
+    logSuccess,
+    logAlert,
+    pendingSubQueue,
+  });
+
+  if (bundleTracker.enabled) {
+    log("Bundle Tracker activé — détection Jito Bundle sur Pump.fun");
   }
 
   // Connect WebSocket
