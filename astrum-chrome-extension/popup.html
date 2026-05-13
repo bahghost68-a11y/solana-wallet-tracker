@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Astrum Token Scraper</title>
+  <link rel="stylesheet" href="css/popup.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Header -->
+    <header class="header">
+      <div class="header-left">
+        <img src="icons/icon48.png" alt="Logo" class="logo">
+        <div>
+          <h1>Astrum Scraper</h1>
+          <span class="subtitle">Token Data Extractor</span>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button id="btn-refresh" class="btn-icon" title="Rafraîchir">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
+        </button>
+        <button id="btn-export" class="btn-icon" title="Exporter JSON">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        </button>
+        <button id="btn-clear" class="btn-icon btn-danger" title="Effacer les données">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Status bar -->
+    <div class="status-bar" id="status-bar">
+      <span class="status-dot" id="status-dot"></span>
+      <span id="status-text">En attente de données...</span>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs">
+      <button class="tab active" data-tab="tokens">Tokens</button>
+      <button class="tab" data-tab="api">API Logs</button>
+      <button class="tab" data-tab="raw">Raw Data</button>
+    </div>
+
+    <!-- Token List Tab -->
+    <div class="tab-content active" id="tab-tokens">
+      <div id="token-list" class="token-list">
+        <div class="empty-state">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#475569" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+          <p>Aucun token capturé</p>
+          <p class="hint">Naviguez sur <strong>app.astrum.trade</strong> ou un site supporté (Axiom, Photon, GMGN...) avec l'extension Astrum active.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- API Logs Tab -->
+    <div class="tab-content" id="tab-api">
+      <div id="api-list" class="api-list">
+        <div class="empty-state">
+          <p>Aucune requête API interceptée</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Raw Data Tab -->
+    <div class="tab-content" id="tab-raw">
+      <pre id="raw-data" class="raw-data">{ }</pre>
+    </div>
+
+    <!-- Token Detail Modal -->
+    <div id="token-modal" class="modal hidden">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h2 id="modal-title">Token Details</h2>
+          <button id="modal-close" class="btn-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <div id="modal-body" class="modal-body"></div>
+        <div class="modal-footer">
+          <button id="modal-copy" class="btn btn-primary">Copier JSON</button>
+          <button id="modal-export" class="btn btn-secondary">Exporter</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script src="js/popup.js"></script>
+</body>
+</html>

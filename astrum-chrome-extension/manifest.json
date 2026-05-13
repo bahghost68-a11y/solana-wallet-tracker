@@ -1,0 +1,60 @@
+{
+  "manifest_version": 3,
+  "name": "Astrum Token Scraper",
+  "version": "1.0.0",
+  "description": "Récupère automatiquement toutes les informations d'un token depuis Astrum.trade (Health Index, Tradability, Dev Stats, Astrum Index, prix, liquidité, etc.)",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "https://app.astrum.trade/*",
+    "https://*.astrum.trade/*"
+  ],
+  "background": {
+    "service_worker": "js/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://app.astrum.trade/*",
+        "https://*.astrum.trade/*"
+      ],
+      "js": ["js/content.js"],
+      "css": ["css/content.css"],
+      "run_at": "document_idle",
+      "all_frames": true
+    },
+    {
+      "matches": [
+        "https://axiom.trade/*",
+        "https://photon-sol.tinyastro.io/*",
+        "https://www.gmgn.ai/*",
+        "https://gmgn.ai/*",
+        "https://bullx.io/*",
+        "https://dexscreener.com/*",
+        "https://pump.fun/*",
+        "https://twitter.com/*",
+        "https://x.com/*",
+        "https://web.telegram.org/*"
+      ],
+      "js": ["js/content-external.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
