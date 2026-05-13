@@ -1,0 +1,45 @@
+/* Astrum Token Scraper — Content CSS */
+/* Minimal styling: only a small indicator badge when data is captured */
+
+.astrum-scraper-badge {
+  position: fixed;
+  bottom: 12px;
+  left: 12px;
+  z-index: 999999;
+  background: linear-gradient(135deg, #0f172a, #1e293b);
+  border: 1px solid #8b5cf6;
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-family: 'Inter', -apple-system, sans-serif;
+  font-size: 11px;
+  color: #a5b4fc;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: 0 2px 8px rgba(139, 92, 246, 0.2);
+}
+
+.astrum-scraper-badge:hover {
+  background: linear-gradient(135deg, #1e293b, #334155);
+  border-color: #a78bfa;
+  transform: translateY(-1px);
+}
+
+.astrum-scraper-badge .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #22c55e;
+  animation: pulse 2s infinite;
+}
+
+.astrum-scraper-badge.no-data .dot {
+  background: #f59e0b;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
